@@ -13,20 +13,39 @@ local IsFast    = nil
 local LifeTimer = nil
 local Level     = nil
 local LastSprite = nil
-local HitCount  = nil
 local Bashed    = nil
 local Caught    = nil
 local Thrown    = nil
+local Charged   = nil
+local DmgBonus  = nil
+local PopTimer  = nil
+local LeveledHit  = nil
+local LeveledTmr  = nil
+
+local RealDeath = nil
+
+local POP_LEN = 3
+local LEVELED_RESET = 20
+
+local function DieForReal( self )
+	self:SetNetPropBoolean( RealDeath, true )
+	self:Deactivate()
+end
 
 function Sweatwhirl:RegisterNetProps()
 	IsFast     = self:AddNetPropBoolean()
 	LifeTimer  = self:AddNetPropInt32()
 	Level      = self:AddNetPropInt32()
 	LastSprite = self:AddNetPropInt32()
-	HitCount   = self:AddNetPropInt32()
+	PopTimer   = self:AddNetPropInt32()
+	LeveledHit = self:AddNetPropBoolean()
+	LeveledTmr = self:AddNetPropInt32()
 	Bashed     = self:AddNetPropBoolean()
 	Caught     = self:AddNetPropBoolean()
 	Thrown     = self:AddNetPropBoolean()
+	Charged    = self:AddNetPropBoolean()
+	DmgBonus   = self:AddNetPropInt32()
+	RealDeath  = self:AddNetPropBoolean()
 end
 
 function Sweatwhirl:MarkCaught()
@@ -43,6 +62,12 @@ end
 
 function Sweatwhirl:DropWithVapor()
 	self:SetNetPropBoolean( Caught, false )
+	DieForReal( self )
+end
+
+function Sweatwhirl:DropSilent()
+	self:SetNetPropBoolean( Caught, false )
+	self:SetNetPropBoolean( Bashed, true )
 	self:Deactivate()
 end
 
@@ -80,14 +105,22 @@ function Sweatwhirl:InitArticle( InArticleData, Creator, InLocation, InFacing, I
 	self:SetNetPropInt32( LifeTimer, 0 )
 
 	local charged = Hodan2_Shared.NextWhirlCharged
+	self:SetNetPropBoolean( Charged, charged and true or false )
 	self:SetNetPropInt32( Level, 1 )
+	self:SetNetPropInt32( DmgBonus, tonumber( Hodan2_Shared.NextWhirlDmgBonus ) or 0 )
 	self:SetNetPropInt32( LastSprite, 0 )
 
+	if ( Hodan2_Shared.NextWhirlSpikeToss ) then
+		Hodan2_Shared.NextWhirlSpikeToss = false
+		self:SetNetPropBoolean( Thrown, true )
+		self:SetVelocity( Vector2D:new( 0.0, -10.0 * SCALE ) )
+		return
+	end
+
 	local dir       = ( InFacing == ERivalsFacingDirection.Right ) and 1.0 or -1.0
-	local base_hsp  = ( fast or charged ) and 7.0 or 3.0
-	local boost     = charged and 1.4 or 1.0
+	local hsp_px    = charged and 11.0 or ( fast and 7.0 or 3.0 )
 	local arcing    = fast and not charged
-	local hsp       = base_hsp * SCALE * dir * boost
+	local hsp       = hsp_px * SCALE * dir
 	local vsp       = arcing and ( 5.0 * SCALE ) or 0.0
 	self:SetVelocity( Vector2D:new( hsp, vsp ) )
 end
@@ -112,8 +145,24 @@ function Sweatwhirl:ArticleUpdate()
 		return
 	end
 
+	local pop = self:GetNetPropInt32( PopTimer )
+	if ( pop > 0 ) then
+		self:SetVelocity( Vector2D:new( 0.0, 0.0 ) )
+		pop = pop - 1
+		self:SetNetPropInt32( PopTimer, pop )
+		if ( pop <= 0 ) then DieForReal( self ) end
+		return
+	end
+
 	local t = self:GetNetPropInt32( LifeTimer ) + 1
 	self:SetNetPropInt32( LifeTimer, t )
+
+	local ltmr = self:GetNetPropInt32( LeveledTmr )
+	if ( ltmr > 0 ) then
+		ltmr = ltmr - 1
+		self:SetNetPropInt32( LeveledTmr, ltmr )
+		if ( ltmr == 0 ) then self:SetNetPropBoolean( LeveledHit, false ) end
+	end
 
 	Sweatwhirl.CheckVapourLevel( self )
 
@@ -123,18 +172,18 @@ function Sweatwhirl:ArticleUpdate()
 		self:SetNetPropInt32( LastSprite, lvl )
 	end
 
-	local life = self:GetNetPropBoolean( IsFast ) and 120 or 170
+	local life = self:GetNetPropBoolean( IsFast ) and 200 or 900
 	if ( t >= life ) then
-		self:Deactivate()
+		DieForReal( self )
 	end
 end
 
 function Sweatwhirl:OnDeactivated()
 	if ( self:GetNetPropBoolean( Bashed ) ) then return end
 	if ( self:GetNetPropBoolean( Caught ) ) then return end
-	if ( self:GetNetPropInt32( LifeTimer ) > 5 ) then
+	if ( self:GetNetPropBoolean( RealDeath ) ) then
 		Sweatwhirl.SpawnVapourOnDeath( self )
-		self:SpawnVfx( "sweatwhirlhit" )
+		self:SpawnVfx( "stinky_sweatwhirl_fx" )
 	end
 end
 
@@ -143,20 +192,40 @@ function Sweatwhirl:OnParried()
 	self:Deactivate()
 end
 
+local function DeathSfxName( self )
+	if ( self:GetNetPropBoolean( IsFast ) or self:GetNetPropBoolean( Charged ) ) then
+		return "sfx_stinky_steam1"
+	end
+	return "sfx_stinky_steam2"
+end
+
 function Sweatwhirl:OnHitRival( OtherRival, Hitbox )
-	self:ApplyHitpauseDirect( OtherRival:GetRemainingHitpauseFrames() )
-	local hc = self:GetNetPropInt32( HitCount ) + 1
-	self:SetNetPropInt32( HitCount, hc )
-	local level = self:GetNetPropInt32( Level )
-	if ( level < 3 and hc >= level ) then self:Deactivate() end
+	local id = Hitbox and Hitbox.HitboxID or 1
+	if ( id == 2 ) then
+		local lvl = self:GetNetPropInt32( Level )
+		self:SetNetPropBoolean( LeveledHit, true )
+		self:SetNetPropInt32( LeveledTmr, LEVELED_RESET )
+		self:ApplyHitpauseDirect( lvl == 2 and 4 or 8 )
+		return
+	end
+	if ( id == 3 ) then return end
+	if ( self:GetNetPropInt32( PopTimer ) > 0 ) then return end
+	self:PlaySFX( DeathSfxName( self ) )
+	if ( self:GetNetPropBoolean( Charged ) ) then
+		self:MoveToLocation( OtherRival:GetLocation2D() )
+		self:SetNetPropInt32( PopTimer, OtherRival:GetRemainingHitpauseFrames() + 1 + POP_LEN )
+		self:SetVelocity( Vector2D:new( 0.0, 0.0 ) )
+	else
+		DieForReal( self )
+	end
 end
 function Sweatwhirl:OnHitGround( HitPosition )
-	self:PlaySFX( "sfx_stinky_steam2" )
-	self:Deactivate()
+	self:PlaySFX( DeathSfxName( self ) )
+	DieForReal( self )
 end
 function Sweatwhirl:OnHitWall( HitPosition )
-	self:PlaySFX( "sfx_stinky_steam2" )
-	self:Deactivate()
+	self:PlaySFX( DeathSfxName( self ) )
+	DieForReal( self )
 end
 
 function Sweatwhirl:CheckVapourLevel()
@@ -167,15 +236,19 @@ function Sweatwhirl:CheckVapourLevel()
 	local vaps = owner:GetMyArticlesTableByName( "Vapour" )
 	if ( vaps == nil ) then return end
 	local p = self:GetLocation2D()
-	local r = 75.0 * SCALE
+	local rx = 100.0
+	local ry = 125.0
 	for _, vap in pairs( vaps ) do
 		if ( not Vapour.IsDying( vap ) ) then
 		local vp = vap:GetLocation2D()
 		local dx, dy = vp.X - p.X, vp.Y - p.Y
-		if ( ( dx * dx + dy * dy ) < ( r * r ) ) then
+		if ( dx >= -rx and dx <= rx and dy >= -ry and dy <= ry ) then
 			if     ( lvl == 1 ) then self:PlaySFX( "sfx_stinky_steam1" )
 			elseif ( lvl == 2 ) then self:PlaySFX( "sfx_stinky_steam2" ) end
 			self:SetNetPropInt32( Level, math.min( 3, lvl + 1 ) )
+			self:SetNetPropBoolean( LeveledHit, false )
+			self:SetNetPropInt32( LeveledTmr, 0 )
+			vap:SpawnVfx( "water_light_omni_spr" )
 			Vapour.StartDying( vap )
 			return
 		end
@@ -202,50 +275,91 @@ function Sweatwhirl:SpawnVapourOnDeath()
 	if ( vap ~= nil ) then vap:MoveToLocation( self:GetLocation2D() ) end
 end
 
+local MAIN_RADIUS = { 80.0, 95.0, 130.0 }
+
 function Sweatwhirl:GetActiveHitboxes( bIgnoreHitboxLocation )
 	if ( self:GetNetPropBoolean( Caught ) ) then return true end
-	local fast = self:GetNetPropBoolean( IsFast )
-	local lvl  = self:GetNetPropInt32( Level )
-	local dmg    = ( fast and 3 or 2 ) + ( lvl - 1 ) * 2
-	local bkb    = ( fast and 7.0 or 5.0 ) + ( lvl - 1 ) * 2.0
-	local kbs    = fast and 0.2 or 0.1
-	local angle  = fast and 50 or 60
+	local fast    = self:GetNetPropBoolean( IsFast )
+	local charged = self:GetNetPropBoolean( Charged )
+	local lvl     = self:GetNetPropInt32( Level )
+	local frames  = self:GetNetPropInt32( LifeTimer )
+
+	local pop = self:GetNetPropInt32( PopTimer )
+	if ( pop > 0 ) then
+		if ( pop <= POP_LEN ) then
+			local pop_bkb = 6.0
+			if     ( lvl >= 3 ) then pop_bkb = 12.0
+			elseif ( lvl >= 2 ) then pop_bkb = 10.0 end
+			self:Lua_AppendHitbox(
+				self:GetAttack(), 3, POP_LEN - pop, POP_LEN,
+				Vector.new( 0.0, 0.0, 0.0 ),
+				75.0,
+				1,
+				pop_bkb, 0.4, 55,
+				8, 0.25, 0,
+				1.0, 0.0, 1,
+				0.7, false,
+				true,
+				0, "sfx_stinky_steam2", ""
+			)
+		end
+		return true
+	end
+
+	local leveled   = lvl >= 2
+	local pull_live = leveled and ( lvl >= 3 or not self:GetNetPropBoolean( LeveledHit ) )
+	local main_live = not pull_live
+
+	local sb = self:GetNetPropInt32( DmgBonus )
+	if ( fast and sb > 0 ) then sb = sb - 1 end
+	local dmg = ( fast and 3 or 2 ) + sb
+	local bkb = fast and 7.0 or 5.0
+	if ( not charged ) then
+		if     ( lvl >= 3 ) then bkb = fast and 11.0 or 5.0
+		elseif ( lvl >= 2 ) then bkb = fast and 9.0 or 7.0 end
+	end
+	local kbs   = fast and 0.2 or 0.1
+	local angle = fast and 50 or 60
 	if ( self:GetNetPropBoolean( Thrown ) ) then angle = 270 end
-	local radius = 24.0 + ( lvl - 1 ) * 14.0
-	local hit_sound
-	if ( lvl >= 2 ) then hit_sound = "sfx_stinky_steam2"
-	elseif ( fast )  then hit_sound = "sfx_stinky_steam1"
-	else                  hit_sound = "sfx_stinky_steam2" end
+	local radius = MAIN_RADIUS[ math.min( lvl, 3 ) ]
+	local hit_sound = fast and "sfx_stinky_steam1" or "sfx_stinky_steam2"
 
-	local base_hitpause
-	if     ( lvl >= 3 ) then base_hitpause = 2
-	elseif ( lvl >= 2 ) then base_hitpause = 8
-	else                     base_hitpause = 4 end
-	local rehit_frames = ( lvl >= 3 ) and 10 or 0
-
+	if ( main_live ) then
 	self:Lua_AppendHitbox(
-		self:GetAttack(),
-		1,
-		self:GetNetPropInt32( LifeTimer ),
-		2,
+		self:GetAttack(), 1, frames, 2,
 		Vector.new( 0.0, 0.0, 0.0 ),
 		radius,
 		dmg,
-		bkb,
-		kbs,
-		angle,
-		base_hitpause,
-		0.25,
-		0,
-		1.0,
-		0.0,
-		1,
-		0.5,
-		false,
-		true,
-		rehit_frames,
-		hit_sound,
-		""
+		bkb, kbs, angle,
+		4, 0.25, 0,
+		1.0, 0.0, 1,
+		0.5, false,
+		( not fast ) and ( not charged ),
+		4,
+		hit_sound, ""
 	)
+	end
+
+	if ( pull_live ) then
+		local v = self:GetVelocity2D()
+		local offz = v.Y
+		if ( self:GetNetPropBoolean( Thrown ) ) then offz = offz + 70.0 end
+		local pull_dmg
+		if ( lvl >= 3 ) then pull_dmg = charged and 2 or 1
+		else                 pull_dmg = charged and 3 or 2 end
+		self:Lua_AppendHitbox(
+			self:GetAttack(), 2, frames, 2,
+			Vector.new( v.X, 0.0, offz ),
+			80.0,
+			pull_dmg,
+			4.0, 0.0, 0,
+			2, 0.0, 0,
+			0.01, 0.0, 1,
+			1.0, false,
+			true,
+			( lvl >= 3 ) and 2 or 4,
+			"sfx_stinky_steam2", ""
+		)
+	end
 	return true
 end

@@ -1,0 +1,8 @@
+{
+  "mappings": [
+    { "r1_palette": 0, "r2_skin": "Default", "r2_color_slot": "Default" },
+    { "r1_palette": 1, "r2_skin": "Default", "r2_color_slot": "Blue" },
+    { "r1_palette": 2, "r2_skin": "Default", "r2_color_slot": "Red" },
+    { "r1_palette": 3, "r2_skin": "Default", "r2_color_slot": "Green" }
+  ]
+}

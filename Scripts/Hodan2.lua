@@ -15,14 +15,30 @@ local STEAM_BUFFER = 10
 local STEAM_VIS    = 0.7
 local JAB_LOOP_WINDOW = 2
 
+local BTHROW_AIRHIT_WINDOW = 3
+
+local function MyAttack( self )
+	local st = self:GetState()
+	if ( st == ERivalsCharacterState.Attack
+			or st == ERivalsCharacterState.LandingLag ) then
+		return self:GetAttack()
+	end
+	return ERivalsCharacterAttack.None
+end
+
 Hodan2_Shared = Hodan2_Shared or {}
 Hodan2_Shared.NextWhirlCharged     = false
 Hodan2_Shared.NextVapourIsParry    = false
 Hodan2_Shared.ForceFast            = false
+Hodan2_Shared.NextWhirlDmgBonus    = 0
+Hodan2_Shared.NextWhirlSpikeToss   = false
 Hodan2_Shared.NextAfterimageKey      = ""
 Hodan2_Shared.NextAfterimageMode     = ""
 Hodan2_Shared.NextAfterimageLifetime = 0
 Hodan2_Shared.NextSteamParticleKey   = ""
+Hodan2_Shared.NextSteamAlign         = "h"
+Hodan2_Shared.NextSteamDir           = 1
+Hodan2_Shared.NextSteamBothMaxed     = false
 
 local MOD_UA_ROOT = "/Game/ModContent/3752556104/UnrealAssets/Articles/"
 local MOD_PA_ROOT = "/Game/ModContent/3752556104/PublishedAssets/Articles/"
@@ -69,14 +85,18 @@ local DspecThrew = nil
 local UspecLanded = nil
 local PrevAttackEnum = nil
 local LastNonNoneAttack = nil
+local BthrowAirHit  = nil
 local InVapourFrame = nil
 local HeldWhirlLevel = nil
 local WindupFlashFired = nil
 local JabShakePlaying = nil
+local SteamSfxPlayed = nil
+local NairSplashed = nil
+local DspecGrounded = nil
+local AdodgeDir = nil
 
 local function GetSteam( ent, handle ) return ent:GetNetPropInt32( handle ) / 100.0 end
 local function SetSteam( ent, handle, v ) ent:SetNetPropInt32( handle, math.floor( v * 100.0 + 0.5 ) ) end
-
 
 function Hodan2:RegisterNetProps()
 	SteamH       = self:AddNetPropInt32()
@@ -103,13 +123,31 @@ function Hodan2:RegisterNetProps()
 	PrevAttackEnum = self:AddNetPropInt32()
 	LastNonNoneAttack = self:AddNetPropInt32()
 	InVapourFrame = self:AddNetPropInt32()
+	BthrowAirHit  = self:AddNetPropInt32()
 	HeldWhirlLevel = self:AddNetPropInt32( 1, 3 )
 	WindupFlashFired = self:AddNetPropBoolean()
 	JabShakePlaying = self:AddNetPropBoolean()
+	SteamSfxPlayed = self:AddNetPropBoolean()
+	NairSplashed = self:AddNetPropBoolean()
+	DspecGrounded = self:AddNetPropBoolean()
+	AdodgeDir = self:AddNetPropInt32( 0, 9 )
+end
+
+local function HasLiveWhirl( ent )
+	local sws = ent:GetMyArticlesTableByName( "Sweatwhirl" )
+	if ( sws == nil ) then return false end
+	for _, sw in pairs( sws ) do
+		if ( sw:GetWindowName() ~= "Held" ) then return true end
+	end
+	return false
 end
 
 function Hodan2:SetAttack( InAttack, InputFramesAgo, bRightStick )
-	if ( InAttack == ERivalsCharacterAttack.Fair ) then
+	if ( InAttack == ERivalsCharacterAttack.Nspecial or InAttack == ERivalsCharacterAttack.Fspecial ) then
+		if ( HasLiveWhirl( self ) ) then
+			return false
+		end
+	elseif ( InAttack == ERivalsCharacterAttack.Fair ) then
 		local h = GetSteam( self, SteamH )
 		local facing = self:GetFacingDirectionFloat()
 		if ( ( h * facing ) >= 0.85 ) then
@@ -129,18 +167,45 @@ function Hodan2:SetAttack( InAttack, InputFramesAgo, bRightStick )
 	return self:Super_SetAttack( InAttack, InputFramesAgo, bRightStick )
 end
 
+local STEAM_HOLD_STATES = {
+	[ERivalsCharacterState.AirDodge]     = true,
+	[ERivalsCharacterState.Parry]        = true,
+	[ERivalsCharacterState.SpotDodge]    = true,
+	[ERivalsCharacterState.RollForward]  = true,
+	[ERivalsCharacterState.RollBackward] = true,
+	[ERivalsCharacterState.JumpSquat]    = true,
+	[ERivalsCharacterState.RunTurn]      = true,
+	[ERivalsCharacterState.RunStop]      = true,
+	[ERivalsCharacterState.DashStop]     = true,
+	[ERivalsCharacterState.Land]         = true,
+	[ERivalsCharacterState.LandingLag]   = true,
+}
+
 function Hodan2:UpdateSteam()
 	local frame = self:GetMatchFrame()
+
+	if ( STEAM_HOLD_STATES[ self:GetState() ] ) then
+		self:SetNetPropInt32( SteamHBuf, frame )
+		self:SetNetPropInt32( SteamVBuf, frame )
+		return
+	end
+
+	local grounded = self:IsGrounded()
 	local right = self:IsRightDown()
 	local left  = self:IsLeftDown()
 	local down  = self:IsDownDown() and not self:IsUpDown()
 
 	local h = GetSteam( self, SteamH )
 	if right and not left then
-		h = math.min( 1.0, h + STEAM_CHARGE )
+		local rate = ( h < 0 ) and ( STEAM_CHARGE + STEAM_DECAY ) or STEAM_CHARGE
+		h = math.min( 1.0, h + rate )
 		self:SetNetPropInt32( SteamHBuf, frame )
 	elseif left and not right then
-		h = math.max( -1.0, h - STEAM_CHARGE )
+		local rate = ( h > 0 ) and ( STEAM_CHARGE + STEAM_DECAY ) or STEAM_CHARGE
+		h = math.max( -1.0, h - rate )
+		self:SetNetPropInt32( SteamHBuf, frame )
+	elseif ( not grounded and math.abs( h ) >= 1.0
+			and ( self:GetVelocity2D().X * h ) > 0.0 ) then
 		self:SetNetPropInt32( SteamHBuf, frame )
 	elseif frame - self:GetNetPropInt32( SteamHBuf ) > STEAM_BUFFER then
 		if h > STEAM_DECAY then h = h - STEAM_DECAY
@@ -157,6 +222,17 @@ function Hodan2:UpdateSteam()
 		if v < -STEAM_DECAY then v = v + STEAM_DECAY else v = 0.0 end
 	end
 	SetSteam( self, SteamV, v )
+
+	local charged_now = ( math.abs( h ) >= 0.85 or v <= -0.85 )
+	local played = self:GetNetPropBoolean( SteamSfxPlayed )
+	if ( charged_now and not played ) then
+		self:SetNetPropBoolean( SteamSfxPlayed, true )
+		self:PlaySFX( "sfx_stinky_charged" )
+	elseif ( played and not charged_now
+			and math.abs( h ) < STEAM_CHARGE + STEAM_DECAY
+			and math.abs( v ) < STEAM_CHARGE + STEAM_DECAY ) then
+		self:SetNetPropBoolean( SteamSfxPlayed, false )
+	end
 end
 
 function Hodan2:MaxSteamFromVapour()
@@ -186,7 +262,7 @@ function Hodan2:UpdateSteamVisual()
 end
 
 function Hodan2:UpdateSteamLatch()
-	local atk  = self:GetAttack()
+	local atk  = MyAttack( self )
 	local prev = self:GetNetPropInt32( PrevAttackEnum )
 	self:SetNetPropInt32( PrevAttackEnum, atk )
 
@@ -206,6 +282,7 @@ function Hodan2:UpdateSteamLatch()
 	self:SetNetPropBoolean( LatchBwd, in_vap or ( h * facing ) <= -0.85 )
 	self:SetNetPropBoolean( LatchV,   v <= -0.85 )
 	self:SetNetPropBoolean( UspBoosted,     false )
+	self:SetNetPropInt32( BthrowAirHit,     0 )
 	self:SetNetPropBoolean( JabCancel,      false )
 	self:SetNetPropBoolean( JabLoopArmed,   false )
 	self:SetNetPropBoolean( NairJc,         false )
@@ -219,27 +296,32 @@ function Hodan2:OnHitRival( OtherRival, Hitbox )
 	self:Super_OnHitRival( OtherRival, Hitbox )
 	if ( OtherRival == nil ) then return end
 
+	if ( self:GetAttack() == ERivalsCharacterAttack.Bthrow
+			and not self:WasGroundedAtFrameStart()
+			and self:GetNetPropInt32( BthrowAirHit ) == 0 ) then
+		self:SetNetPropInt32( BthrowAirHit, 1 )
+	end
+
+	local host = Hitbox:GetHitboxHostActor()
+	if ( host ~= nil and host:GetEntityIndex() ~= self:GetEntityIndex() ) then return end
+
 	local attack = self:GetAttack()
 	local hbox   = Hitbox.HitboxID
 
-
-	if ( attack == ERivalsCharacterAttack.Jab and hbox == 0 ) then
-		self:SetNetPropBoolean( JabCancel, true )
-	elseif ( attack == ERivalsCharacterAttack.Nair ) then
-		self:SetNetPropBoolean( NairJc, true )
-	elseif ( attack == ERivalsCharacterAttack.Dspecial ) then
-		self:SetNetPropBoolean( DspecJc, true )
+	local usp_like = attack == ERivalsCharacterAttack.Uspecial
+		or attack == ERivalsCharacterAttack.UspecialAir
+	if ( ( usp_like or attack == ERivalsCharacterAttack.Dspecial )
+			and self:GetNetPropBoolean( Holding ) and hbox <= 1 ) then
+		OtherRival:TakeDamage( 2 )
+		local kv = OtherRival:GetKnockbackVelocity()
+		OtherRival:SetKnockbackVelocity( Vector2D:new( kv.X * 1.1, kv.Y * 1.1 ) )
+		Hodan2.OnCarriedWhirlHit( self, OtherRival )
 	end
 
-	if ( attack == ERivalsCharacterAttack.Uair ) then
-		local v = self:GetVelocity2D()
-		self:SetVelocityVertical( math.max( v.Y, 4.0 ) )
-	end
-
-	if ( attack == ERivalsCharacterAttack.Dspecial and hbox == 1
-			and self:WasGroundedAtFrameStart() ) then
+	if ( attack == ERivalsCharacterAttack.Dspecial and hbox == 0
+			and not self:GetNetPropBoolean( DspecGrounded ) ) then
 		local v = OtherRival:GetKnockbackVelocity()
-		OtherRival:SetKnockbackVelocity( Vector2D:new( v.X * 0.4, v.Y * 0.4 ) )
+		OtherRival:SetKnockbackVelocity( Vector2D:new( v.X * 0.78, v.Y * 0.78 ) )
 		self:PlaySFX( "sfx_blow_weak2" )
 	end
 
@@ -248,10 +330,10 @@ function Hodan2:OnHitRival( OtherRival, Hitbox )
 		or attack == ERivalsCharacterAttack.Dtilt
 		or attack == ERivalsCharacterAttack.Utilt
 		or attack == ERivalsCharacterAttack.Uair
-		or ( attack == ERivalsCharacterAttack.DAttack and self:GetNetPropBoolean( LatchFwd ) and hbox == 1 )
-		or ( ( attack == ERivalsCharacterAttack.Uspecial or attack == ERivalsCharacterAttack.UspecialAir ) and hbox == 1 )
-		or ( attack == ERivalsCharacterAttack.Dspecial and self:WasGroundedAtFrameStart() and hbox == 1 )
-		or ( attack == DSTRONG_CHARGED )
+		or ( attack == ERivalsCharacterAttack.DAttack and self:GetNetPropBoolean( LatchFwd ) and hbox == 0 )
+		or ( usp_like and hbox == 0 )
+		or ( attack == ERivalsCharacterAttack.Dspecial and self:GetNetPropBoolean( DspecGrounded ) and hbox == 0 )
+		or ( attack == DSTRONG_CHARGED and hbox >= 1 )
 	if ( plays_steam ) then
 		self:PlaySFX( "sfx_stinky_steam1" )
 		self:SpawnVfx( "stinky_splash_fx" )
@@ -260,20 +342,24 @@ function Hodan2:OnHitRival( OtherRival, Hitbox )
 	local h_charged = self:GetNetPropBoolean( LatchH )
 	local v_charged = self:GetNetPropBoolean( LatchV )
 
-	if ( v_charged and ( attack == ERivalsCharacterAttack.Uspecial
-			or attack == ERivalsCharacterAttack.UspecialAir ) ) then
+	if ( v_charged and usp_like ) then
 		self:PlaySFX( "sfx_blow_heavy2" )
 		self:SpawnVfx( "stinky_uspecial_charged_fx" )
+		if ( hbox == 0 ) then
+			local v = OtherRival:GetKnockbackVelocity()
+			OtherRival:SetKnockbackVelocity( Vector2D:new( v.X * 1.3, v.Y * 1.3 ) )
+		end
 	end
 
-	if ( h_charged and attack == ERivalsCharacterAttack.DAttack ) then
+	if ( h_charged and attack == ERivalsCharacterAttack.DAttack and hbox == 0 ) then
 		self:PlaySFX( "sfx_blow_heavy2" )
 	end
 
-	if ( not h_charged ) then return end
+	if ( not h_charged and not v_charged ) then return end
 
-	local bonus = v_charged and 3 or 2
-	local scale = v_charged and 1.22 or 1.15
+	local double_charged = h_charged and v_charged
+	local bonus = double_charged and 3 or 2
+	local scale = double_charged and 1.22 or 1.15
 	OtherRival:TakeDamage( bonus )
 	local v = OtherRival:GetKnockbackVelocity()
 	OtherRival:SetKnockbackVelocity( Vector2D:new( v.X * scale, v.Y * scale ) )
@@ -288,7 +374,12 @@ function Hodan2:OnGrabSuccess( Hitbox, GrabVictim )
 end
 
 function Hodan2:UpdateChargedDstrong()
-	local atk = self:GetAttack()
+	if ( MyAttack( self ) == ERivalsCharacterAttack.Dstrong
+			and self:GetWindow() == 2 and self:GetWindowTimer() == 0 ) then
+		self:PlaySFX( "sfx_land_heavy" )
+	end
+
+	local atk = MyAttack( self )
 	local win = self:GetWindow()
 	local want = atk == DSTRONG_CHARGED
 		and ( ( win == 1 and self:GetWindowTimer() >= 11 ) or win == 2 )
@@ -319,24 +410,79 @@ function Hodan2:ArmorHitbox( Hitbox )
 	self:PlaySFX( "sfx_stinky_steam2" )
 end
 
+local AIRDODGE_SUFFIX = {
+	[0] = { "forward",     "back"        },
+	[1] = { "upforward",   "upback"      },
+	[2] = { "up",          "up"          },
+	[3] = { "upback",      "upforward"   },
+	[4] = { "back",        "forward"     },
+	[5] = { "downback",    "downforward" },
+	[6] = { "down",        "down"        },
+	[7] = { "downforward", "downback"    },
+}
+
+function Hodan2:UpdateAirdodgeDir()
+	if ( self:GetState() ~= ERivalsCharacterState.AirDodge ) then
+		if ( self:GetNetPropInt32( AdodgeDir ) ~= 0 ) then
+			self:SetNetPropInt32( AdodgeDir, 0 )
+		end
+		return
+	end
+	if ( self:GetNetPropInt32( AdodgeDir ) ~= 0 ) then return end
+	local v = self:GetVelocity2D()
+	if ( ( v.X * v.X + v.Y * v.Y ) < 1.0 ) then
+		self:SetNetPropInt32( AdodgeDir, 9 )
+		return
+	end
+	local ang = self:GetAirdodgeAngle() % 360.0
+	self:SetNetPropInt32( AdodgeDir, ( math.floor( ( ang + 22.5 ) / 45.0 ) % 8 ) + 1 )
+end
+
 function Hodan2:UpdateChargedSprites()
-	local atk = self:GetAttack()
+	local atk = MyAttack( self )
 	local want, key = false, nil
 	if ( atk == ERivalsCharacterAttack.DAttack and self:GetNetPropBoolean( LatchFwd ) ) then
 		want, key = true, "dattack_strong"
+	elseif ( ( atk == ERivalsCharacterAttack.Grab
+			or atk == ERivalsCharacterAttack.DashGrab
+			or atk == ERivalsCharacterAttack.PivotGrab )
+			and self:GetGrabPartner() ~= nil ) then
+		want, key = true, "grab_hold"
+	else
+		local dir = self:GetNetPropInt32( AdodgeDir )
+		if ( dir == 9 ) then
+			want, key = true, "airdodge"
+		elseif ( dir ~= 0 ) then
+			local pair = AIRDODGE_SUFFIX[dir - 1]
+			local suffix
+			if ( self:GetFacingDirection() == ERivalsFacingDirection.Left ) then
+				suffix = pair[2]
+			else
+				suffix = pair[1]
+			end
+			want, key = true, "airdodge_" .. suffix
+		end
 	end
 	local active = self:GetNetPropBoolean( AnimOverride )
-	if ( want and not active ) then
-		self:Set2DAnimation( key )
-		self:SetNetPropBoolean( AnimOverride, true )
-	elseif ( active and not want ) then
+	if ( want ) then
+		if ( not active or self:GetCurrent2DAnimation() ~= key ) then
+			self:Set2DAnimation( key )
+			self:SetNetPropBoolean( AnimOverride, true )
+		end
+	elseif ( active ) then
 		self:Set2DAnimation( "" )
 		self:SetNetPropBoolean( AnimOverride, false )
 	end
 end
 
 function Hodan2:UpdateUtiltHeight()
-	local tall = ( self:GetAttack() == ERivalsCharacterAttack.Utilt ) and ( self:GetWindow() == 2 )
+	local tall = ( MyAttack( self ) == ERivalsCharacterAttack.Utilt ) and ( self:GetWindow() == 1 )
+
+	if ( MyAttack( self ) == ERivalsCharacterAttack.Utilt
+			and self:GetWindow() == 2 and self:GetWindowTimer() == 9 ) then
+		self:PlaySFX( "sfx_land_heavy" )
+	end
+
 	if ( tall ) then
 		if ( not self:GetNetPropBoolean( EcbTall ) ) then
 			self:Set2DEcb( self:GetECBWidth(), self:GetECBHeight() * 1.42 )
@@ -348,6 +494,16 @@ function Hodan2:UpdateUtiltHeight()
 	end
 end
 
+local LJS_LIFT_FRAME   = 12
+local LJS_HURT_RADIUS  = 52.0
+local LJS_HURT_LIFTED  = { -55.0, 0.0, -15.0 }
+
+function Hodan2:UpdateLedgeJumpHurtbox()
+	if ( self:GetState() ~= ERivalsCharacterState.LedgeJumpStart ) then return end
+	if ( self:GetStateTimer() < LJS_LIFT_FRAME ) then return end
+	self:SetHurtboxRadiusOffset( "Body", LJS_HURT_RADIUS,
+		Vector:new( LJS_HURT_LIFTED[1], LJS_HURT_LIFTED[2], LJS_HURT_LIFTED[3] ) )
+end
 
 local function AfterimageKeyForAttack( ent )
 	local atk = ent:GetAttack()
@@ -372,19 +528,19 @@ function Hodan2:UpdateAfterimage()
 end
 
 function Hodan2:UpdateChargedFlashOverlay()
-	local atk = self:GetAttack()
+	local atk = MyAttack( self )
 	local win = self:GetWindow()
 	local wt  = self:GetWindowTimer()
 	local wl  = self:GetWindowLength()
 
 	local windup_key = nil
-	if ( IsFairAttack( atk ) and win == 1
+	if ( IsFairAttack( atk ) and win == 0
 			and wt >= wl - 3 and self:GetNetPropBoolean( LatchFwd ) ) then
 		windup_key = "fair_strong_flash"
-	elseif ( atk == ERivalsCharacterAttack.DAttack and win == 1
+	elseif ( atk == ERivalsCharacterAttack.DAttack and win == 0
 			and wt >= wl - 3 and self:GetNetPropBoolean( LatchFwd ) ) then
 		windup_key = "dattack_strong_flash"
-	elseif ( atk == DSTRONG_CHARGED and win == 2
+	elseif ( atk == DSTRONG_CHARGED and win == 1
 			and wt >= 3 and wt <= 5 ) then
 		windup_key = "dstrong_strong_flash"
 	end
@@ -418,40 +574,79 @@ function Hodan2:UpdateChargedFlashOverlay()
 	end
 end
 
-function Hodan2:UpdateSteamParticles()
-	local h = math.abs( GetSteam( self, SteamH ) )
-	local v = math.abs( GetSteam( self, SteamV ) )
-	if ( h <= STEAM_VIS and v <= STEAM_VIS ) then return end
-	if ( self:GetRandomFloat() >= 0.10 ) then return end
+function Hodan2:UpdateNairSplash()
+	local atk = MyAttack( self )
+	if ( atk == ERivalsCharacterAttack.Nair
+			and self:GetState() ~= ERivalsCharacterState.LandingLag ) then
+		self:SetNetPropBoolean( NairSplashed, false )
+		return
+	end
+	if ( self:GetNetPropBoolean( NairSplashed ) ) then return end
+	local landed =
+		( atk == ERivalsCharacterAttack.Nair
+			and self:GetState() == ERivalsCharacterState.LandingLag )
+		or ( self:GetNetPropInt32( PrevAttackEnum ) == ERivalsCharacterAttack.Nair
+			and atk == ERivalsCharacterAttack.None
+			and self:IsGrounded() )
+	if ( landed ) then
+		self:SetNetPropBoolean( NairSplashed, true )
+		self:SpawnVfx( "stinky_splash_fx" )
+		self:PlaySFX( "sfx_stinky_steam2" )
+	end
+end
 
-	local ad = GetSteamParticleAD()
-	if ( ad == nil ) then return end
+local function WantsWalljumpCancel( self )
+	local atk = MyAttack( self )
+	if ( atk == SPECIAL_FALL ) then
+		return true
+	end
+	if ( atk == ERivalsCharacterAttack.Uspecial
+			or atk == ERivalsCharacterAttack.UspecialAir
+			or atk == ERivalsCharacterAttack.Dspecial ) then
+		if ( self:GetVelocity2D().Y <= 0.0 ) then
+			return true
+		end
+	end
+	if ( atk == ERivalsCharacterAttack.Dspecial and IsInVapour( self )
+			and self:GetWindow() >= 1 and self:GetWindow() ~= 3 ) then
+		return true
+	end
+	if ( atk == ERivalsCharacterAttack.Nspecial
+			and self:GetWindow() >= 2 and not self:WasParried() ) then
+		return true
+	end
+	return false
+end
 
-	local idx = self:GetRandomIntRange( 1, 8 )
-	Hodan2_Shared.NextSteamParticleKey = "steamparticle" .. idx
-	local jitter_x = ( self:GetRandomFloat() - 0.5 ) * 60.0
-	local jitter_y = ( self:GetRandomFloat() - 0.5 ) * 60.0
-	self:CreateArticle( ad, Vector2D:new( jitter_x, 30.0 + jitter_y ), 1.0, "First" )
+function Hodan2:UpdateWalljumpCancel()
+	if ( self:IsGrounded() ) then return end
+	if ( self:GetStateFlag( ERivalsCharacterStateFlag.CanWallJump ) ) then return end
+	if ( not WantsWalljumpCancel( self ) ) then return end
+	self:SetStateFlag( ERivalsCharacterStateFlag.CanWallJump, true )
 end
 
 function Hodan2:UpdateState()
 	self:Super_UpdateState()
+	Hodan2.UpdateWalljumpCancel( self )
 	Hodan2.UpdateSteam( self )
 	Hodan2.UpdateSteamVisual( self )
+	Hodan2.UpdateNairSplash( self )
 	Hodan2.UpdateSteamLatch( self )
 	Hodan2.UpdateChargedDstrong( self )
+	Hodan2.UpdateAirdodgeDir( self )
 	Hodan2.UpdateChargedSprites( self )
 	Hodan2.UpdateAfterimage( self )
 	Hodan2.UpdateChargedFlashOverlay( self )
-	Hodan2.UpdateSteamParticles( self )
 	Hodan2.UpdateHeldWhirl( self )
 	Hodan2.UpdateUtiltHeight( self )
+	Hodan2.UpdateLedgeJumpHurtbox( self )
 	Hodan2.MaybeEnterSpecialFall( self )
 	Hodan2.UpdateJabShake( self )
 	Hodan2.ResolveUstrongGrabFacing( self )
 end
 
 function Hodan2:ResolveUstrongGrabFacing()
+	if ( self:GetState() ~= ERivalsCharacterState.Attack ) then return end
 	if ( self:GetAttack() ~= ERivalsCharacterAttack.Ustrong ) then return end
 	if ( self:GetWindow() ~= 4 or self:GetWindowTimer() ~= 0 ) then return end
 	if ( self:GetGrabPartner() == nil ) then return end
@@ -465,7 +660,7 @@ end
 
 function Hodan2:UpdateJabShake()
 	local in_loop = (
-		self:GetAttack() == ERivalsCharacterAttack.Jab
+		MyAttack( self ) == ERivalsCharacterAttack.Jab
 		and self:GetWindow() == JAB_LOOP_WINDOW
 	)
 	local playing = self:GetNetPropBoolean( JabShakePlaying )
@@ -484,20 +679,75 @@ function Hodan2:UpdateJabShake()
 end
 
 function Hodan2:MaybeEnterSpecialFall()
-	local curr = self:GetAttack()
+	local curr = MyAttack( self )
 	if ( curr ~= ERivalsCharacterAttack.None ) then
 		self:SetNetPropInt32( LastNonNoneAttack, curr )
 		return
 	end
-	if ( self:IsGrounded() ) then return end
+	local st = self:GetState()
+	if ( st ~= ERivalsCharacterState.Fall and st ~= ERivalsCharacterState.FallStart ) then
+		self:SetNetPropInt32( LastNonNoneAttack, ERivalsCharacterAttack.None )
+		return
+	end
 	local last = self:GetNetPropInt32( LastNonNoneAttack )
-	if ( last == ERivalsCharacterAttack.Uspecial ) then
+	if ( last == ERivalsCharacterAttack.Uspecial
+			or last == ERivalsCharacterAttack.UspecialAir ) then
 		self:SetAttack( SPECIAL_FALL )
 	end
 end
 
 function Hodan2:MoveGrabPartner()
+	if ( self:GetState() ~= ERivalsCharacterState.Attack ) then
+		self:Super_MoveGrabPartner()
+		return
+	end
+
 	local partner = self:GetGrabPartner()
+
+	if ( partner ~= nil ) then
+		local ta = self:GetAttack()
+		local dir = self:GetFacingDirectionFloat()
+		local hpos = self:GetLocation2D()
+		local tw, tt, twl = self:GetWindow(), self:GetWindowTimer(), self:GetWindowLength()
+		local pos = nil
+		if ( ta == ERivalsCharacterAttack.Uthrow ) then
+			local t = ( tw > 0 ) and 1.0
+				or math.max( 0.0, math.min( 1.0, ( tt - ( twl - 4 ) ) / 3.0 ) )
+			pos = Vector2D:new(
+				hpos.X + ( 90.0 + ( 10.0 - 90.0 ) * t ) * dir,
+				hpos.Y + 10.0 + ( 150.0 - 10.0 ) * t )
+		elseif ( ta == ERivalsCharacterAttack.Dthrow ) then
+			local t = ( tw > 0 ) and 1.0 or math.min( 1.0, tt / math.max( 1, twl - 1 ) )
+			pos = Vector2D:new(
+				hpos.X + ( 90.0 + ( 20.0 - 90.0 ) * t ) * dir,
+				hpos.Y + 10.0 + ( 170.0 - 10.0 ) * t )
+		elseif ( ta == ERivalsCharacterAttack.Fthrow ) then
+			pos = Vector2D:new( hpos.X + 110.0 * dir, hpos.Y + 2.0 )
+		elseif ( ta == ERivalsCharacterAttack.Bthrow ) then
+			local BT_CENTER_Y = 100.0
+			local BT_RADIUS   = 90.0
+			local ang
+			if ( tw > 0 ) then
+				ang = 270.0
+			else
+				local a = ( tt / math.max( 1, twl ) ) * 6.0
+				ang = math.max( 0.0, math.min( 3.0, a - 2.0 ) ) * 90.0
+			end
+			local BT_VICTIM_HALF_H = 90.0
+			local r = math.rad( ang )
+			pos = Vector2D:new(
+				hpos.X + BT_RADIUS * math.cos( r ) * dir,
+				hpos.Y + BT_CENTER_Y + BT_RADIUS * math.sin( r ) - BT_VICTIM_HALF_H )
+			local mesh_ang = ang - 90.0
+			if ( dir < 0 ) then mesh_ang = 180.0 - mesh_ang end
+			partner:SetMeshRotationCenter( mesh_ang )
+		end
+		if ( pos ~= nil ) then
+			partner:MoveToLocation( pos )
+			return
+		end
+	end
+
 	if ( partner ~= nil and self:GetAttack() == ERivalsCharacterAttack.Ustrong ) then
 		local win  = self:GetWindow()
 		local r1x, r1y
@@ -536,13 +786,15 @@ function Hodan2:MoveGrabPartner()
 	self:Super_MoveGrabPartner()
 end
 
-
 function Hodan2:SpawnSweatwhirl()
 	local ad = GetSweatwhirlAD()
 	if ( ad == nil ) then return false end
 
 	Hodan2_Shared.NextWhirlCharged = self:GetNetPropBoolean( LatchBwd )
 	Hodan2_Shared.ForceFast        = false
+	local sh = self:GetNetPropBoolean( LatchH )
+	local sv = self:GetNetPropBoolean( LatchV )
+	Hodan2_Shared.NextWhirlDmgBonus = ( sh and sv and 3 ) or ( ( sh or sv ) and 2 ) or 0
 
 	local off = Vector2D:new( 32.0 * SCALE, 38.0 * SCALE )
 
@@ -598,12 +850,48 @@ local function GetHeldSweatwhirl( self )
 	return nil
 end
 
+function Hodan2:OnCarriedWhirlHit( OtherRival )
+	local sw = GetHeldSweatwhirl( self )
+	if ( sw ~= nil ) then
+		sw:MoveToLocation( OtherRival:GetLocation2D() )
+		Sweatwhirl.DropWithVapor( sw )
+	end
+	self:SetNetPropBoolean( Holding, false )
+	self:PlaySFX( "sfx_stinky_steam2" )
+end
+
+function Hodan2:SpawnVapourAt( OffX, OffY )
+	local vap_ad = GetVapourAD()
+	if ( vap_ad == nil ) then return end
+	local existing = self:GetMyArticlesTableByName( "Vapour" )
+	if ( existing ~= nil ) then
+		local count, first = 0, nil
+		for _, v in pairs( existing ) do
+			count = count + 1
+			if ( first == nil ) then first = v end
+		end
+		if ( count >= 3 and first ~= nil ) then first:Deactivate() end
+	end
+	self:CreateArticle( vap_ad, Vector2D:new( OffX, OffY ), 1.0, "First" )
+end
+
+function Hodan2:GroundedSpecialStartSplash()
+	if ( self:GetWindow() == 0
+			and self:GetWindowTimer() == self:GetWindowLength() - 1
+			and self:WasGroundedAtFrameStart() ) then
+		self:SpawnVfx( "stinky_splash_fx" )
+	end
+end
+
 function Hodan2:UpdateHeldWhirl()
 	if ( not self:GetNetPropBoolean( Holding ) ) then return end
-	local a = self:GetAttack()
+	local a = MyAttack( self )
 	local dir = self:GetFacingDirectionFloat()
+	local catching = a == ERivalsCharacterAttack.Dspecial
+		or a == ERivalsCharacterAttack.Uspecial
+		or a == ERivalsCharacterAttack.UspecialAir
 
-	if ( a == ERivalsCharacterAttack.Dspecial
+	if ( catching
 			and self:GetWindow() == DSPEC_W4_IDX
 			and self:GetWindowTimer() == DSPEC_THROW_FRAME
 			and not self:GetNetPropBoolean( DspecThrew ) ) then
@@ -620,13 +908,19 @@ function Hodan2:UpdateHeldWhirl()
 		return
 	end
 
-	if ( a == ERivalsCharacterAttack.Uspecial or a == ERivalsCharacterAttack.Dspecial ) then
+	if ( catching ) then
 		return
 	end
 
 	local sw = GetHeldSweatwhirl( self )
 	if ( sw ~= nil ) then
-		Sweatwhirl.DropWithVapor( sw )
+		if ( self:IsInHitstun() ) then
+			Sweatwhirl.DropSilent( sw )
+			self:PlaySFX( "sfx_stinky_steam2" )
+			self:SpawnVfx( "stinky_sweatwhirl_fx" )
+		else
+			Sweatwhirl.DropWithVapor( sw )
+		end
 	end
 	self:SetNetPropBoolean( Holding, false )
 end
@@ -647,12 +941,13 @@ function Hodan2:UpdateAttack()
 
 	if ( Attack == ERivalsCharacterAttack.Nspecial or Attack == ERivalsCharacterAttack.Fspecial ) then
 		local w = self:GetWindow()
-		if ( w <= 1 ) then
+		if ( w == 0 ) then
 			self:SetNetPropBoolean( SpecSpawned, false )
 		elseif ( not self:GetNetPropBoolean( SpecSpawned ) ) then
 			Hodan2.SpawnSweatwhirl( self )
 			self:SetNetPropBoolean( SpecSpawned, true )
 		end
+		Hodan2.GroundedSpecialStartSplash( self )
 
 	elseif ( Attack == ERivalsCharacterAttack.Uspecial or Attack == ERivalsCharacterAttack.UspecialAir ) then
 		if ( self:GetWindow() == 1 ) then
@@ -663,16 +958,26 @@ function Hodan2:UpdateAttack()
 			end
 			if ( self:GetNetPropBoolean( LatchV ) and not self:GetNetPropBoolean( UspBoosted ) ) then
 				self:SetNetPropBoolean( UspBoosted, true )
-				self:SetVelocityVertical( self:GetVelocity2D().Y + 6.0 * SCALE )
+				self:SetVelocity( Vector2D:new(
+					5.0 * SCALE * self:GetFacingDirectionFloat(), 25.0 * SCALE ) )
 				self:PlaySFX( "sfx_swipe_heavy1" )
 			end
+			if ( self:GetNetPropBoolean( LatchV ) and self:GetWindowTimer() > 10 ) then
+				local vy = self:GetVelocity2D().Y
+				if ( vy > 0.0 ) then
+					self:SetVelocityVertical( math.max( 0.0, vy - 1.0 * SCALE ) )
+				end
+			end
 		end
-		if ( not self:GetNetPropBoolean( UspecLanded )
-				and self:WasGroundedAtFrameStart() and self:GetWindow() >= 2 ) then
-			self:SetNetPropBoolean( UspecLanded, true )
-			self:SpawnVfx( "special_splash" )
-		end
+		Hodan2.GroundedSpecialStartSplash( self )
 		Hodan2.TryCatchSweatwhirl( self )
+		if ( self:GetNetPropBoolean( Holding ) ) then
+			local w = self:GetWindow()
+			if ( ( w == 1 and self:GetWindowTimer() >= self:GetWindowLength() - 1 )
+					or w == 2 ) then
+				self:SetWindow( DSPEC_W4_IDX )
+			end
+		end
 
 	elseif ( Attack == ERivalsCharacterAttack.DAttack ) then
 		if ( self:GetNetPropBoolean( LatchFwd ) ) then
@@ -681,20 +986,33 @@ function Hodan2:UpdateAttack()
 
 	elseif ( Attack == ERivalsCharacterAttack.Dspecial ) then
 		Hodan2.TryCatchSweatwhirl( self )
+		Hodan2.GroundedSpecialStartSplash( self )
+
+		if ( self:GetWindow() == 0 ) then
+			self:SetNetPropBoolean( DspecGrounded, self:WasGroundedAtFrameStart() )
+		end
 
 		if ( self:GetWindow() == 1 and not self:GetNetPropBoolean( UspBoosted )
-				and self:WasGroundedAtFrameStart() ) then
+				and self:GetNetPropBoolean( DspecGrounded ) ) then
 			self:SetNetPropBoolean( UspBoosted, true )
 			local dir = self:GetFacingDirectionFloat()
 			if ( self:IsHoldingBackward() ) then
-				self:SetVelocity( Vector2D:new( -4.0 * SCALE * dir, 12.0 * SCALE ) )
+				self:SetVelocity( Vector2D:new( 4.0 * SCALE * dir, 12.0 * SCALE ) )
 			else
 				self:SetVelocityHorizontal( 9.0 * SCALE * dir )
 			end
 		end
 
-		if ( self:GetNetPropBoolean( DspecJc )
+		if ( self:GetWindow() >= 1 and IsInVapour( self )
 				and self:IsInputActionDown( ERivalsBufferedInputAction.Jump, true, true ) ) then
+			if ( self:GetNetPropBoolean( Holding ) ) then
+				local sw = GetHeldSweatwhirl( self )
+				if ( sw ~= nil ) then
+					Sweatwhirl.ReleaseToThrow( sw,
+						3.0 * SCALE * self:GetFacingDirectionFloat(), 0.0, false )
+				end
+				self:SetNetPropBoolean( Holding, false )
+			end
 			self:EndAttackNaturally()
 		end
 
@@ -726,19 +1044,15 @@ function Hodan2:UpdateAttack()
 		end
 
 	elseif ( Attack == ERivalsCharacterAttack.Uair ) then
-		if ( self:IsInputActionDown( ERivalsBufferedInputAction.Attack, true, false ) ) then
-			local v = self:GetVelocity2D()
-			if ( v.Y < -2.0 ) then
-				self:SetVelocityVertical( -2.0 )
-			end
+		if ( self:GetWindow() == 1
+				and self:IsInputActionDown( ERivalsBufferedInputAction.Attack, true, false ) ) then
+			local g = self:GetGravity()
+			if ( g == nil or g <= 0.0 ) then g = 1.5 end
+			self:SetVelocityVertical( self:GetVelocity2D().Y + 0.5 * g )
 		end
 
 	elseif ( Attack == ERivalsCharacterAttack.Jab ) then
 		Hodan2.UpdateJabLoop( self )
-		if ( self:GetNetPropBoolean( JabCancel )
-				and self:GetInputHistory():GetActionPressed( ERivalsBufferedInputAction.Attack ) ) then
-			self:EndAttackNaturally()
-		end
 
 	elseif ( Attack == ERivalsCharacterAttack.Nair ) then
 		if ( self:GetWindow() == 1 ) then
@@ -753,9 +1067,44 @@ function Hodan2:UpdateAttack()
 			end
 		end
 
-		if ( self:GetNetPropBoolean( NairJc )
-				and self:IsInputActionDown( ERivalsBufferedInputAction.Jump, true, true ) ) then
-			self:EndAttackNaturally()
+	elseif ( Attack == ERivalsCharacterAttack.Bthrow ) then
+		if ( self:GetNetPropInt32( BthrowAirHit ) == 1
+				and self:GetRemainingHitpauseFrames() == 0 ) then
+			self:SetNetPropInt32( BthrowAirHit, 2 )
+			self:SetWindow( BTHROW_AIRHIT_WINDOW )
+		end
+
+	elseif ( Attack == ERivalsCharacterAttack.GetupSpecial ) then
+		if ( self:GetWindow() == 2 and not self:GetNetPropBoolean( UspBoosted ) ) then
+			self:SetNetPropBoolean( UspBoosted, true )
+			if ( not HasLiveWhirl( self ) ) then
+				local ad = GetSweatwhirlAD()
+				if ( ad ~= nil ) then
+					Hodan2_Shared.NextWhirlCharged   = false
+					Hodan2_Shared.NextWhirlDmgBonus  = 0
+					Hodan2_Shared.NextWhirlSpikeToss = true
+					self:CreateArticle( ad, Vector2D:new( -20.0, 60.0 ), 1.0, "Travel" )
+				end
+			end
+			local v = self:GetVelocity2D()
+			self:SetVelocityHorizontal( v.X * 0.5 )
+			self:SetVelocityVertical( 8.0 * SCALE )
+			self:PlaySFX( "sfx_swipe_medium2" )
+		end
+
+	elseif ( Attack == ERivalsCharacterAttack.LedgeSpecial ) then
+		if ( self:GetWindow() == 1 and not self:GetNetPropBoolean( UspBoosted ) ) then
+			self:SetNetPropBoolean( UspBoosted, true )
+			Hodan2.SpawnVapourAt( self, -70.0, 70.0 )
+			self:PlaySFX( "sfx_stinky_steam1" )
+		end
+		self:SetHurtboxRadiusOffset( "Body", 52.0, Vector.new( -55.0, 0.0, -87.5 ) )
+
+	elseif ( Attack == ERivalsCharacterAttack.PummelSpecial ) then
+		if ( self:GetWindow() == 2 and not self:GetNetPropBoolean( UspBoosted ) ) then
+			self:SetNetPropBoolean( UspBoosted, true )
+			Hodan2.SpawnVapourAt( self, 340.0, 50.0 )
+			self:PlaySFX( "sfx_stinky_steam2" )
 		end
 	end
 
